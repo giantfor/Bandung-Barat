@@ -1,0 +1,307 @@
+
+// =====================================================
+// DETEKSI AREA LONGSOR PASIRLANGU - CISARUA
+// EVENT JANUARI 2026
+// DATA: SENTINEL-1 SAR + SRTM + CHIRPS
+// OUTPUT: PETA MERAH + CSV POLYGON LONGSOR
+// TANPA RANDOM SAMPLE
+// =====================================================
+
+
+// =====================================================
+// 1. BEBERAPA TITIK REFERENSI AREA LONGSOR
+// =====================================================
+
+var titikLongsor = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([107.53694, -6.79722]), {name: 'Pasirlangu'}),
+  ee.Feature(ee.Geometry.Point([107.53580, -6.80350]), {name: 'Pasir Kuning / Babakan'}),
+  ee.Feature(ee.Geometry.Point([107.53417, -6.82250]), {name: 'Pasir Halang'}),
+  ee.Feature(ee.Geometry.Point([107.53950, -6.80720]), {name: 'Area Aliran Material 1'}),
+  ee.Feature(ee.Geometry.Point([107.53180, -6.81200]), {name: 'Area Aliran Material 2'}),
+  ee.Feature(ee.Geometry.Point([107.52890, -6.81750]), {name: 'Area Hilir Material'})
+]);
+
+var roi = titikLongsor.geometry().buffer(6000);
+
+Map.centerObject(roi, 13);
+Map.setOptions('ROADMAP');
+
+
+// =====================================================
+// 2. PERIODE SEBELUM DAN SESUDAH LONGSOR
+// =====================================================
+
+var beforeStart = '2025-12-15';
+var beforeEnd   = '2026-01-23';
+
+var afterStart  = '2026-01-24';
+var afterEnd    = '2026-02-28';
+
+
+// =====================================================
+// 3. SENTINEL-1 SAR
+// =====================================================
+
+function getS1(startDate, endDate) {
+  return ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(roi)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select(['VV', 'VH'])
+    .median()
+    .clip(roi);
+}
+
+var s1Before = getS1(beforeStart, beforeEnd);
+var s1After  = getS1(afterStart, afterEnd);
+
+var vvBefore = s1Before.select('VV').rename('VV_Before');
+var vhBefore = s1Before.select('VH').rename('VH_Before');
+var vvAfter  = s1After.select('VV').rename('VV_After');
+var vhAfter  = s1After.select('VH').rename('VH_After');
+
+var deltaVV = vvAfter.subtract(vvBefore).rename('Delta_VV');
+var deltaVH = vhAfter.subtract(vhBefore).rename('Delta_VH');
+
+var sarChange = deltaVV.abs()
+  .add(deltaVH.abs())
+  .rename('SAR_Change');
+
+
+// =====================================================
+// 4. DEM, SLOPE, ASPECT
+// =====================================================
+
+var dem = ee.Image('USGS/SRTMGL1_003')
+  .clip(roi)
+  .rename('Elevation');
+
+var slope = ee.Terrain.slope(dem)
+  .clip(roi)
+  .rename('Slope');
+
+var aspect = ee.Terrain.aspect(dem)
+  .clip(roi)
+  .rename('Aspect');
+
+
+// =====================================================
+// 5. CURAH HUJAN CHIRPS
+// =====================================================
+
+var rainfallJan = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterBounds(roi)
+  .filterDate('2026-01-01', '2026-01-24')
+  .sum()
+  .clip(roi)
+  .rename('Rainfall_Jan_1_23_2026');
+
+var rainfallWeek = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterBounds(roi)
+  .filterDate('2026-01-18', '2026-01-24')
+  .sum()
+  .clip(roi)
+  .rename('Rainfall_Jan_18_23_2026');
+
+
+// =====================================================
+// 6. MASK AREA LONGSOR
+// =====================================================
+// Threshold dapat diatur:
+// 2.0 = merah banyak
+// 2.5 = sedang
+// 3.0 = lebih ketat
+
+var rawMask = sarChange.gt(2.8)
+  .and(slope.gt(18))
+  .selfMask()
+  .clip(roi)
+  .rename('Landslide_Raw');
+
+
+// =====================================================
+// 7. BERSIHKAN NOISE
+// Supaya tidak menjadi ribuan polygon kecil
+// =====================================================
+
+var connected = rawMask.connectedPixelCount({
+  maxSize: 100,
+  eightConnected: true
+});
+
+// Minimal 20 pixel @10 m = ±2.000 m2
+var cleanMask = rawMask
+  .updateMask(connected.gte(20))
+  .focal_mode({
+    radius: 1,
+    units: 'pixels'
+  })
+  .selfMask()
+  .rename('Landslide_Area');
+
+
+// =====================================================
+// 8. DATASET IMAGE LENGKAP
+// =====================================================
+
+var datasetImage = ee.Image.cat([
+  dem,
+  slope,
+  aspect,
+  rainfallJan,
+  rainfallWeek,
+  vvBefore,
+  vhBefore,
+  vvAfter,
+  vhAfter,
+  deltaVV,
+  deltaVH,
+  sarChange,
+  cleanMask.unmask(0).rename('Landslide_Label')
+]).clip(roi);
+
+
+// =====================================================
+// 9. KONVERSI AREA MERAH MENJADI POLYGON
+// =====================================================
+
+var vectorRaw = cleanMask.reduceToVectors({
+  geometry: roi,
+  scale: 20,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'Landslide_Label',
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+
+// =====================================================
+// 10. HITUNG ATRIBUT POLYGON DAN FILTER
+// =====================================================
+
+var vectorWithArea = vectorRaw.map(function(f) {
+  var area = f.geometry().area(10);
+  var centroid = f.geometry().centroid(10);
+  var coord = centroid.coordinates();
+
+  return f.set({
+    Area_m2: area,
+    Longitude: coord.get(0),
+    Latitude: coord.get(1),
+    Event_Date: '2026-01-24',
+    Location: 'Pasirlangu - Cisarua, Bandung Barat',
+    Data_Source: 'Sentinel-1 SAR, SRTM DEM, CHIRPS Rainfall'
+  });
+});
+
+// Buang polygon kecil agar tidak error
+// Naikkan ke 5000 jika masih terlalu banyak
+var landslideVector = vectorWithArea
+  .filter(ee.Filter.gte('Area_m2', 3000))
+  .sort('Area_m2', false)
+  .limit(500);
+
+
+// =====================================================
+// 11. AMBIL NILAI RATA-RATA TIAP POLYGON
+// =====================================================
+
+var landslideDataset = datasetImage.reduceRegions({
+  collection: landslideVector,
+  reducer: ee.Reducer.mean(),
+  scale: 20,
+  tileScale: 4
+});
+
+print('Jumlah Polygon Longsor Setelah Filter:', landslideVector.size());
+print('Dataset Longsor Final:', landslideDataset.limit(20));
+
+
+// =====================================================
+// 12. TAMPILAN PETA MIRIP CONTOH
+// =====================================================
+
+Map.addLayer(
+  cleanMask,
+  {
+    palette: ['red'],
+    opacity: 0.90
+  },
+  'Area Longsor Terdeteksi'
+);
+
+Map.addLayer(
+  titikLongsor,
+  {
+    color: 'black',
+    pointSize: 7
+  },
+  'Beberapa Titik Referensi Longsor'
+);
+
+Map.addLayer(
+  ee.Image().paint(roi, 1, 2),
+  {
+    palette: ['black']
+  },
+  'Batas Area Kajian'
+);
+
+
+// =====================================================
+// 13. EXPORT CSV DATASET LONGSOR
+// =====================================================
+
+Export.table.toDrive({
+  collection: landslideDataset,
+  description: 'Dataset_Longsor_Final_Cisarua_Bandung_Barat_2026',
+  folder: 'GEE_Landslide',
+  fileNamePrefix: 'dataset_longsor_final_cisarua_bandung_barat_2026',
+  fileFormat: 'CSV'
+});
+
+
+// =====================================================
+// 14. EXPORT SHAPE / GEOJSON POLYGON LONGSOR
+// =====================================================
+
+Export.table.toDrive({
+  collection: landslideVector,
+  description: 'Polygon_Area_Longsor_Cisarua_Bandung_Barat_2026',
+  folder: 'GEE_Landslide',
+  fileNamePrefix: 'polygon_area_longsor_cisarua_bandung_barat_2026',
+  fileFormat: 'GeoJSON'
+});
+
+
+// =====================================================
+// 15. EXPORT RASTER AREA LONGSOR
+// =====================================================
+
+Export.image.toDrive({
+  image: cleanMask,
+  description: 'Raster_Area_Longsor_Cisarua_Bandung_Barat_2026',
+  folder: 'GEE_Landslide',
+  fileNamePrefix: 'raster_area_longsor_cisarua_bandung_barat_2026',
+  region: roi,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+
+// =====================================================
+// 16. EXPORT RASTER DATASET LENGKAP
+// =====================================================
+
+Export.image.toDrive({
+  image: datasetImage,
+  description: 'Raster_Dataset_Lengkap_Cisarua_Bandung_Barat_2026',
+  folder: 'GEE_Landslide',
+  fileNamePrefix: 'raster_dataset_lengkap_cisarua_bandung_barat_2026',
+  region: roi,
+  scale: 20,
+  maxPixels: 1e13
+});
